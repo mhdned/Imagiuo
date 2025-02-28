@@ -3,8 +3,9 @@ import { Queue, Worker, Job } from 'bullmq';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ImageService } from '../image/image.service';
-import { createReadStream } from 'fs';
+import { createReadStream, createWriteStream } from 'fs';
 import * as FormData from 'form-data';
+import { join } from 'path';
 
 @Injectable()
 export class ImageProcessingQueue {
@@ -12,6 +13,7 @@ export class ImageProcessingQueue {
 
   private readonly UPLOAD_URL = 'https://api.imagga.com/v2/uploads';
   private readonly TAGGING_URL = 'https://api.imagga.com/v2/tags';
+  private readonly UNSPLASH_API_URL = 'https://api.unsplash.com/search/photos';
 
   constructor(
     private readonly configService: ConfigService,
@@ -28,8 +30,15 @@ export class ImageProcessingQueue {
       'image-processing',
       async (job: Job) => {
         const { imagePath, imageId } = job.data;
-        const keywords = await this.extractKeywords(imagePath);
+        const keywords: { confidence: number; tag: { en: string } }[] =
+          await this.extractKeywords(imagePath);
         await this.imageService.updateKeywords(imageId, keywords);
+        const imageUrls = await this.searchImagesFromUnsplash(
+          keywords.map((keyword) => keyword.tag.en).join(' '),
+        );
+        for (const url of imageUrls) {
+          await this.downloadImage(url, imageId);
+        }
       },
       {
         connection: {
@@ -38,6 +47,46 @@ export class ImageProcessingQueue {
         },
       },
     );
+  }
+
+  private async searchImagesFromUnsplash(query: string): Promise<string[]> {
+    try {
+      const accessKey =
+        this.configService.get<string>('UNSPLASH_ACCESS_KEY') ?? '';
+
+      const response = await axios.get(this.UNSPLASH_API_URL, {
+        params: {
+          query: query,
+          per_page: 2,
+          client_id: accessKey,
+        },
+      });
+
+      const imageUrls = response.data.results.map(
+        (result: any) => result.urls.full,
+      );
+      return imageUrls;
+    } catch (error) {
+      console.error('Error searching for images from Unsplash:', error);
+      return [];
+    }
+  }
+
+  private async downloadImage(url: string, imageId: string): Promise<void> {
+    try {
+      const response = await axios.get(url, { responseType: 'stream' });
+      const filePath = join(__dirname, 'images', `${imageId}.jpg`);
+
+      const writer = createWriteStream(filePath);
+      response.data.pipe(writer);
+
+      return new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+    } catch (error) {
+      console.error('Error downloading image:', error);
+    }
   }
 
   async addJob(imagePath: string, imageId: string) {
